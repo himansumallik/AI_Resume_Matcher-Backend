@@ -1,313 +1,329 @@
 from flask import Flask, request, jsonify
-import spacy
-import PyPDF2
-import os
-import psycopg2
 from flask_cors import CORS
 from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from models import db, Resume
+import spacy
 import os
 import tempfile
-from PyPDF2 import PdfReader  
-from models import db, Resume  
-import re
 from collections import Counter
+import re
+import functions  # Import the functions module
 
-load_dotenv()  # Automatically reads from .env file
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 nlp = spacy.load("en_core_web_sm")
 
-
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:7448596@localhost/resume_matcher'
+# Database Configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL", 'postgresql://postgres:7448596@localhost/resume_matcher')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 db.init_app(app)
 
 with app.app_context():
-    db.create_all()  # This will create the resumes table if it doesn't exist
+    db.create_all()
 
-# Ensure there's an upload folder to save files temporarily
+# Upload Folder Configuration
 UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 
+def handle_file_upload(request_files, field_name, upload_dir):
+    """Handles file upload and returns the file path."""
+    if field_name not in request_files:
+        return None, jsonify({'error': f'No file part in {field_name}'}), 400
 
-def get_db_connection():
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT")
-    )
+    file = request_files[field_name]
+    if file.filename == '':
+        return None, jsonify({'error': 'No selected file'}), 400
 
-
-
-
-def extract_text_from_pdf(pdf_path):
-    text = ""
-    with open(pdf_path, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            text += page.extract_text() or ""
-    return text
-
-
-def extract_keywords(text):
-    """Extract and filter meaningful keywords from text"""
-    # Remove punctuation and convert to lowercase
-    words = re.findall(r'\b\w+\b', text.lower())
-    
-    # Common words to exclude (expand this list as needed)
-    stop_words = {
-        'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours',
-        'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers',
-        'herself', 'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves',
-        'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are',
-        'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does',
-        'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until',
-        'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into',
-        'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down',
-        'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here',
-        'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more',
-        'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so',
-        'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don', 'should', 'now'
-    }
-    
-    # Keep only meaningful words
-    keywords = [
-        word for word in words 
-        if (len(word) > 3 and 
-            word not in stop_words and
-            not word.isdigit())
-    ]
-    
-    # Get most common keywords
-    return [word for word, count in Counter(keywords).most_common(20)]
-
-
-def calculate_match(resume_text, job_desc):
-    resume_doc = nlp(resume_text.lower())
-    job_doc = nlp(job_desc.lower())
-
-    resume_tokens = set([token.lemma_ for token in resume_doc if token.is_alpha])
-    job_tokens = set([token.lemma_ for token in job_doc if token.is_alpha])
-
-    matched = resume_tokens.intersection(job_tokens)
-    match_percent = round(len(matched) / len(job_tokens) * 100, 2) if job_tokens else 0
-    missing_keywords = list(job_tokens - resume_tokens)
-
-    return match_percent, missing_keywords
-
-
-
+    file_path = os.path.join(upload_dir, file.filename)
+    file.save(file_path)
+    return file_path, None, None
 
 
 @app.route('/analyze', methods=['POST'])
 def analyze_resume():
+    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
+    if error:
+        return error, status_code
+
+    job_desc = request.form.get('jobDescription')
+    if not job_desc:
+        os.remove(resume_path)
+        return jsonify({'error': 'Job description is required'}), 400
+
+    print(f"Received job description: {job_desc}")
+    print(f"Received resume file: {os.path.basename(resume_path)}")
+
     try:
-        # [Previous file handling code remains the same...]
-        
-        resume_text = extract_text_from_pdf(resume_path)
-        
-        # Extract and filter keywords from both documents
-        resume_keywords = extract_keywords(resume_text)
-        job_keywords = extract_keywords(job_desc)
-        
-        # Calculate match percentage
+        resume_text = functions.extract_text_from_pdf(resume_path)
+        resume_keywords = functions.extract_keywords(resume_text)
+        job_keywords = functions.extract_keywords(job_desc)
+
         matched = set(resume_keywords) & set(job_keywords)
         match_percent = round(len(matched) / len(job_keywords) * 100, 2) if job_keywords else 0
-        
-        # Get missing keywords (only those that appear in job description)
+
         missing = [kw for kw in job_keywords if kw not in resume_keywords]
-        
-        # Capitalize keywords for better presentation
-        missing_keywords = [kw.capitalize() for kw in missing[:10]]  # Show top 10 missing
-        
+        missing_keywords = [kw.capitalize() for kw in missing[:10]]
+
         return jsonify({
             'matchPercentage': match_percent,
             'missingKeywords': missing_keywords,
-            'suggestedSkills': suggest_related_skills(missing)
+            'suggestedSkills': functions.suggest_related_skills(missing)
         })
-        
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-def filter_job_keywords(keywords):
-    """Filter out common words and keep job-relevant terms"""
-    common_words = {
-        'a', 'an', 'the', 'and', 'or', 'but', 'of', 'at', 'by', 'for', 
-        'in', 'on', 'to', 'with', 'we', 'she', 'he', 'it', 'they', 'them',
-        'his', 'her', 'their', 'our', 'your', 'my', 'this', 'that', 'these',
-        'those', 'is', 'are', 'was', 'were', 'be', 'being', 'been', 'have',
-        'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could',
-        'can', 'may', 'might', 'must', 'shall'
-    }
-    
-    job_related = []
-    for word in keywords:
-        # Keep only nouns/proper nouns and specific verbs (customize as needed)
-        lower_word = word.lower()
-        if (len(word) > 3 and 
-            lower_word not in common_words and
-            word[0].isupper() or word.isupper()):  # Keep proper nouns and acronyms
-            job_related.append(word)
-    
-    return job_related
-
-def suggest_related_skills(keywords):
-    """Suggest related technical skills based on missing keywords"""
-    skill_mappings = {
-        'python': ['Django', 'Flask', 'Pandas', 'NumPy', 'PyTorch'],
-        'java': ['Spring', 'Hibernate', 'J2EE', 'Android'],
-        'javascript': ['React', 'Node.js', 'Vue', 'Angular'],
-        'machine learning': ['TensorFlow', 'Keras', 'scikit-learn', 'AI'],
-        'database': ['SQL', 'MySQL', 'PostgreSQL', 'MongoDB'],
-        'cloud': ['AWS', 'Azure', 'GCP', 'Docker', 'Kubernetes']
-    }
-    
-    suggestions = set()
-    for keyword in keywords:
-        lower_key = keyword.lower()
-        if lower_key in skill_mappings:
-            suggestions.update(skill_mappings[lower_key])
-        # Add partial matches (e.g., "data" -> "database" skills)
-        for skill, related in skill_mappings.items():
-            if skill in lower_key:
-                suggestions.update(related)
-    
-    return list(suggestions)[:10]  # Return top 10 suggestions
-
-
-
-
+        print(f'Error occurred in /analyze: {e}')
+        return jsonify({'error': 'An error occurred while processing the resume'}), 500
+    finally:
+        os.remove(resume_path)
 
 
 @app.route('/recommend', methods=['POST'])
 def recommend_jobs():
-    if 'resume' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    resume_file = request.files['resume']
-    if resume_file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
+    if error:
+        return error, status_code
 
-    # Save resume
-    resume_path = os.path.join(app.config['UPLOAD_FOLDER'], resume_file.filename)
-    resume_file.save(resume_path)
-    resume_text = extract_text_from_pdf(resume_path)
+    try:
+        resume_text = functions.extract_text_from_pdf(resume_path)
+        conn = functions.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, title, company, description FROM jobs")
+        jobs = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
-    # Fetch jobs from DB
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, company, description FROM jobs")
-    jobs = cursor.fetchall()
-    cursor.close()
-    conn.close()
+        resume_doc = nlp(resume_text.lower())
+        resume_tokens = set([token.lemma_ for token in resume_doc if token.is_alpha])
 
-    # Calculate similarity
-    resume_doc = nlp(resume_text.lower())
-    resume_tokens = set([token.lemma_ for token in resume_doc if token.is_alpha])
+        recommendations = []
+        for job in jobs:
+            job_id, title, company, description = job
+            job_doc = nlp(description.lower())
+            job_tokens = set([token.lemma_ for token in job_doc if token.is_alpha])
+            match = resume_tokens.intersection(job_tokens)
+            score = round(len(match) / len(job_tokens) * 100, 2) if job_tokens else 0
+            recommendations.append({
+                'id': job_id,
+                'title': title,
+                'company': company,
+                'description': description,
+                'matchPercentage': score
+            })
 
-    recommendations = []
-    for job in jobs:
-        job_id, title, company, description = job
-        job_doc = nlp(description.lower())
-        job_tokens = set([token.lemma_ for token in job_doc if token.is_alpha])
-        match = resume_tokens.intersection(job_tokens)
-        score = round(len(match) / len(job_tokens) * 100, 2) if job_tokens else 0
-        recommendations.append({
-            'id': job_id,
-            'title': title,
-            'company': company,
-            'description': description,
-            'matchPercentage': score
-        })
+        top_matches = sorted(recommendations, key=lambda x: x['matchPercentage'], reverse=True)[:5]
+        return jsonify(top_matches)
 
-    # Sort and return top 5
-    top_matches = sorted(recommendations, key=lambda x: x['matchPercentage'], reverse=True)[:5]
-    return jsonify(top_matches)
-
-
+    except Exception as e:
+        print(f'Error occurred in /recommend: {e}')
+        return jsonify({'error': 'An error occurred while recommending jobs'}), 500
+    finally:
+        os.remove(resume_path)
 
 
 @app.route('/upload_resume', methods=['POST'])
 def upload_resume():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    
-    file = request.files['file']
+    file_path, error, status_code = handle_file_upload(request.files, 'file', tempfile.gettempdir())
+    if error:
+        return error, status_code
 
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+    try:
+        text = ''
+        if file_path.lower().endswith('.pdf'):
+            with open(file_path, 'rb') as f:
+                reader = PdfReader(f)
+                for page in reader.pages:
+                    text += page.extract_text() or ""
+        else:
+            return jsonify({'error': 'Unsupported file type'}), 400
 
-    # Save the uploaded file temporarily
-    temp_dir = tempfile.gettempdir()
-    file_path = os.path.join(temp_dir, file.filename)
-    file.save(file_path)
+        new_resume = Resume(name=os.path.basename(file_path), content=text)
+        db.session.add(new_resume)
+        db.session.commit()
 
-    # Extract text (example using PyPDF2 for PDFs)
-    text = ''
-    if file.filename.lower().endswith('.pdf'):
-        try:
-            reader = PdfReader(file_path)
-            for page in reader.pages:
-                text += page.extract_text()
-        except Exception as e:
-            return jsonify({'error': f'Error reading PDF: {str(e)}'}), 500
-    else:
-        return jsonify({'error': 'Unsupported file type'}), 400
+        return jsonify({'message': 'Resume uploaded successfully', 'resume_id': new_resume.id}), 200
 
-    # Store resume in database
-    new_resume = Resume(name=file.filename, content=text)
-    db.session.add(new_resume)
-    db.session.commit()
-
-    return jsonify({'message': 'Resume uploaded successfully', 'resume_id': new_resume.id}), 200
-
-
+    except Exception as e:
+        print(f'Error occurred in /upload_resume: {e}')
+        db.session.rollback()
+        return jsonify({'error': f'Error processing uploaded file: {str(e)}'}), 500
+    finally:
+        os.remove(file_path)
 
 
 @app.route('/format-check', methods=['POST'])
 def check_formatting():
-    if 'resume' not in request.files:
-        return jsonify({'error': 'No resume file uploaded'}), 400
-
-    resume_file = request.files['resume']
-    resume_path = os.path.join(app.config['UPLOAD_FOLDER'], resume_file.filename)
-    resume_file.save(resume_path)
+    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
+    if error:
+        return error, status_code
 
     try:
-        resume_text = extract_text_from_pdf(resume_path)
-        
+        resume_text = functions.extract_text_from_pdf(resume_path)
         suggestions = []
+        strengths = []
+        metrics = {
+            'wordCount': len(resume_text.split()),
+            'bulletPoints': resume_text.count('\n•') + resume_text.count('\n-'),
+            'sections': 0,
+            'hasContact': False,
+            'hasSummary': False,
+            'hasEducation': False,
+            'hasExperience': False,
+            'hasSkills': False
+        }
 
-        # Example formatting checks
-        if not any(word.lower() in resume_text.lower() for word in ['summary', 'objective']):
-            suggestions.append("Consider adding a 'Summary' or 'Objective' section.")
+        # ===== Conditional Checks =====
+        # 1. Length Analysis (Only suggest if below threshold)
+        if metrics['wordCount'] < 300:
+            suggestions.append({
+                'type': 'length',
+                'message': "Resume appears too short ({} words). Ideal length is 300-500 words.".format(metrics['wordCount']),
+                'priority': 'high' if metrics['wordCount'] < 200 else 'medium'
+            })
+        else:
+            strengths.append("✓ Appropriate length ({} words)".format(metrics['wordCount']))
+
+        # 2. Section Presence Checks
+        required_sections = {
+            'contact': (r'(email|phone|contact)', "Include contact information"),
+            'summary': (r'(summary|objective|profile)', "Add a professional summary"),
+            'education': (r'education', "Include education section"),
+            'experience': (r'(experience|work\s?history)', "Add work experience"),
+            'skills': (r'(skills|technical\s?skills)', "List technical skills")
+        }
+
+        for section, (pattern, suggestion) in required_sections.items():
+            if not re.search(pattern, resume_text, re.IGNORECASE):
+                suggestions.append({
+                    'type': section,
+                    'message': suggestion,
+                    'priority': 'high' if section in ['contact', 'experience'] else 'medium'
+                })
+            else:
+                strengths.append("✓ Complete {} section".format(section))
+                metrics[f'has{section.capitalize()}'] = True
+
+        # 3. Bullet Points Analysis (Only suggest if sparse)
+        if metrics['bulletPoints'] < 10:
+            suggestions.append({
+                'type': 'formatting',
+                'message': "Low bullet point count ({}). Use bullet points to highlight achievements.".format(metrics['bulletPoints']),
+                'priority': 'medium'
+            })
+        else:
+            strengths.append("✓ Good use of bullet points ({})".format(metrics['bulletPoints']))
+
+        # 4. Contact Info Validation
+        if not (re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', resume_text) and 
+                re.search(r'(\+\d{1,2}\s?)?(\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}', resume_text)):
+            suggestions.append({
+                'type': 'contact',
+                'message': "Missing email or phone number",
+                'priority': 'high'
+            })
+        else:
+            metrics['hasContact'] = True
+
+        # 5. Skills Quantification (Only suggest if <5 skills)
+        skills_match = re.search(r'(?i)skills:(.*?)(?:\n\n|\n\w+:)', resume_text)
+        if skills_match:
+            skills_count = len([s.strip() for s in skills_match.group(1).split(',') if s.strip()])
+            metrics['skillsCount'] = skills_count
+            if skills_count < 5:
+                suggestions.append({
+                    'type': 'skills',
+                    'message': "Consider adding more skills (currently {})".format(skills_count),
+                    'priority': 'medium'
+                })
+        elif metrics['hasSkills']:  # Has skills section but no countable skills
+            suggestions.append({
+                'type': 'skills',
+                'message': "Skills section is empty",
+                'priority': 'medium'
+            })
+
+        # 6. Section Count Analysis
+        metrics['sections'] = sum(1 for section in required_sections if metrics[f'has{section.capitalize()}'])
+        if metrics['sections'] >= 4:
+            strengths.append("✓ Well-structured ({} sections)".format(metrics['sections']))
+        else:
+            suggestions.append({
+                'type': 'structure',
+                'message': "Resume could use more sections (currently {})".format(metrics['sections']),
+                'priority': 'medium'
+            })
+
+        # ===== Final Filtering =====
+        # Only include suggestions that meet minimum priority thresholds
+        filtered_suggestions = [s for s in suggestions if s['priority'] in ('high', 'medium')]
         
-        if len(resume_text.split()) < 300:
-            suggestions.append("Your resume looks a bit short. Consider elaborating on your projects or experiences.")
-
-        if not any(word.lower() in resume_text.lower() for word in ['education']):
-            suggestions.append("Add an 'Education' section with degrees and universities.")
-
-        if not any(word.lower() in resume_text.lower() for word in ['experience', 'work']):
-            suggestions.append("Add a 'Work Experience' section detailing your previous roles.")
-
-        if not suggestions:
-            suggestions.append("Your resume formatting looks good!")
-
-        return jsonify({'suggestions': suggestions})
+        return jsonify({
+            'suggestions': filtered_suggestions,
+            'strengths': strengths,
+            'metrics': metrics,
+            'score': functions.calculate_score(filtered_suggestions)
+        })
 
     except Exception as e:
-        print("Error in format-check:", e)
-        return jsonify({'error': 'Failed to analyze resume formatting. Please try again.'}), 500
+        print(f"Error in /format-check: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        os.remove(resume_path)
 
 
 
+@app.route('/api/analyze-match', methods=['POST'])
+def analyze_match():
+    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
+    if error:
+        return error, status_code
+    
+    job_desc = request.form.get('job_description', '')
+    try:
+        resume_text = functions.extract_text_from_pdf(resume_path)
+        match_percent, missing_kws = functions.calculate_match(resume_text, job_desc)
+        suggested_skills = functions.suggest_related_skills(missing_kws)
+        
+        return jsonify({
+            'matchPercentage': match_percent,
+            'missingKeywords': missing_kws,
+            'suggestedSkills': suggested_skills
+        })
+    finally:
+        os.remove(resume_path)
+
+@app.route('/api/extract-keywords', methods=['POST'])
+def extract_keywords_endpoint():
+    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
+    if error:
+        return error, status_code
+    
+    try:
+        resume_text = functions.extract_text_from_pdf(resume_path)
+        keywords = functions.extract_keywords(resume_text)
+        filtered_keywords = functions.filter_job_keywords(keywords)
+        return jsonify({'keywords': filtered_keywords})
+    finally:
+        os.remove(resume_path)
+
+
+@app.route('/api/extract-strengths', methods=['POST'])
+def extract_strengths_endpoint():
+    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
+    if error:
+        return error, status_code
+    
+    try:
+        resume_text = functions.extract_text_from_pdf(resume_path)
+        strengths = functions.extract_strengths(resume_text)  # Use the new extract_strengths function
+        return jsonify({'strengths': strengths})
+    finally:
+        os.remove(resume_path)
 
 
 if __name__ == '__main__':
