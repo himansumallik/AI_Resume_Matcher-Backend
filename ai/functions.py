@@ -1,3 +1,4 @@
+import datetime
 import spacy
 import PyPDF2
 import re
@@ -12,6 +13,9 @@ nlp = spacy.load("en_core_web_sm")
 
 
 
+
+
+
 def get_db_connection():
     """Establishes a database connection using environment variables."""
     return psycopg2.connect(
@@ -21,6 +25,9 @@ def get_db_connection():
         host=os.getenv("DB_HOST"),
         port=os.getenv("DB_PORT")
     )
+
+
+
 
 
 
@@ -40,8 +47,8 @@ def extract_text_from_pdf(pdf_path):
 
 
 
-import re
-from collections import Counter
+
+
 
 def extract_keywords(text, max_keywords=20):
     """Extracts and filters meaningful keywords from the given text."""
@@ -74,6 +81,8 @@ def extract_keywords(text, max_keywords=20):
 
 
 
+
+
 def calculate_match(resume_text, job_desc):
     """Calculates the match percentage between resume and job description."""
     resume_doc = nlp(resume_text.lower())
@@ -87,6 +96,10 @@ def calculate_match(resume_text, job_desc):
     missing_keywords = list(job_tokens - resume_tokens)
 
     return match_percent, missing_keywords
+
+
+
+
 
 
 
@@ -107,6 +120,9 @@ def filter_job_keywords(keywords):
             (word[0].isupper() or word.isupper()))  # Keep proper nouns and acronyms
     ]
     return job_related
+
+
+
 
 
 
@@ -165,3 +181,102 @@ def calculate_score(suggestions):
     score -= critical * 10  # -10 points per critical issue
     score -= warnings * 5   # -5 points per warning
     return max(0, min(100, score))
+
+
+
+def estimate_experience(text):
+    """Estimates years of experience from resume text."""
+    import re
+    from datetime import datetime
+
+    year_pattern = r'(\d+)\s*(years?|yrs?)'
+    duration_pattern = r'(20\d{2})\s*[-–]\s*(20\d{2}|present|now)'
+
+    year_matches = re.findall(year_pattern, text.lower())
+    duration_matches = re.findall(duration_pattern, text.lower())
+
+    total_years = 0
+
+    for match in year_matches:
+        try:
+            total_years += int(match[0])
+        except:
+            pass
+
+    for match in duration_matches:
+        try:
+            start_year = int(match[0])
+            end_year = datetime.now().year if match[1] in ['present', 'now'] else int(match[1])
+            total_years += (end_year - start_year)
+        except:
+            pass
+
+    # Use a simple average if duration_matches found, else just cap the total years
+    if duration_matches:
+        estimated_years = total_years // max(1, len(duration_matches))
+    else:
+        estimated_years = total_years
+
+    return min(estimated_years, 15)  # Cap at 15 years
+
+def estimate_required_experience(job_desc):
+    """Estimates required years from job description."""
+    patterns = [
+        r'(\d+)\+?\s*years?\s*experience',
+        r'experience\s*of\s*(\d+)\+?\s*years?',
+        r'(\d+)\s*-\s*(\d+)\s*years?\s*experience'
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, job_desc.lower())
+        if matches:
+            if isinstance(matches[0], tuple):  # For ranges like "3-5 years"
+                return int(matches[0][1])  # Take the upper bound
+            return int(matches[0])  # Take single number
+    
+    return 3  # Default if not specified
+
+def calculate_ats_score(resume_text):
+    """Calculates ATS compatibility score (0-100)."""
+    checks = {
+        'has_contact_info': bool(re.search(r'(\b[\w\.-]+@[\w\.-]+\.\w{2,4}\b)|(\b\d{3}[-.]?\d{3}[-.]?\d{4}\b)', resume_text)),
+        'has_work_history': bool(re.search(r'(experience|work history|employment)', resume_text, re.I)),
+        'has_education': bool(re.search(r'(education|academic background|qualifications)', resume_text, re.I)),
+        'has_skills': bool(re.search(r'(skills|technical skills|competencies)', resume_text, re.I)),
+        'proper_headings': len(re.findall(r'^\s*[A-Z][A-Za-z ]+:\s*$', resume_text, re.M)) >= 3
+    }
+    
+    return round(sum(checks.values()) / len(checks) * 100)
+
+def check_ats_issues(resume_text):
+    """Identifies potential ATS issues."""
+    issues = []
+    
+    if not re.search(r'^\s*[A-Z][A-Za-z ]+:\s*$', resume_text, re.M):
+        issues.append("Consider using standard section headings (e.g., 'Experience:', 'Education:')")
+    
+    if len(resume_text.split()) > 800:
+        issues.append("Resume might be too long (consider keeping under 2 pages)")
+    
+    if re.search(r'columns?|tables?|graphics?|images?', resume_text, re.I):
+        issues.append("Avoid using columns/tables/graphics as they may confuse ATS")
+    
+    return issues
+
+def generate_suggestions(missing_keywords, exp_years, req_years, resume_text):
+    """Generates improvement suggestions."""
+    suggestions = []
+    
+    if missing_keywords:
+        suggestions.append(f"Add these keywords to your resume: {', '.join(missing_keywords[:5])}")
+    
+    if exp_years < req_years:
+        suggestions.append(f"Highlight transferable skills to compensate for experience gap ({exp_years} vs {req_years} years)")
+    
+    if not re.search(r'\bachievements?\b|\baccomplishments?\b', resume_text, re.I):
+        suggestions.append("Add an 'Achievements' section with quantifiable results")
+    
+    if len(re.findall(r'\bincreased\b|\bimproved\b|\breduced\b|\bsaved\b', resume_text, re.I)) < 3:
+        suggestions.append("Include more measurable achievements (e.g., 'Increased sales by 30%')")
+    
+    return suggestions[:5]

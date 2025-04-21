@@ -9,6 +9,7 @@ import tempfile
 from collections import Counter
 import re
 import functions  # Import the functions module
+from gpt_model import evaluate_resume_against_job
 
 load_dotenv()
 
@@ -51,37 +52,65 @@ def analyze_resume():
     if error:
         return error, status_code
 
-    job_desc = request.form.get('jobDescription')
+    job_desc = request.form.get('job_description')
     if not job_desc:
         os.remove(resume_path)
         return jsonify({'error': 'Job description is required'}), 400
 
-    print(f"Received job description: {job_desc}")
-    print(f"Received resume file: {os.path.basename(resume_path)}")
-
     try:
+        # Extract text and keywords
         resume_text = functions.extract_text_from_pdf(resume_path)
         resume_keywords = functions.extract_keywords(resume_text)
         job_keywords = functions.extract_keywords(job_desc)
 
-        matched = set(resume_keywords) & set(job_keywords)
-        match_percent = round(len(matched) / len(job_keywords) * 100, 2) if job_keywords else 0
+        # Calculate matches
+        matched_keywords = list(set(resume_keywords) & set(job_keywords))
+        missing_keywords = [kw for kw in job_keywords if kw not in resume_keywords]
+        
+        # Calculate percentages
+        match_percent = round(len(matched_keywords) / len(job_keywords) * 100, 2) if job_keywords else 0
+        coverage_percent = round(len(matched_keywords) / len(resume_keywords) * 100, 2) if resume_keywords else 0
 
-        missing = [kw for kw in job_keywords if kw not in resume_keywords]
-        missing_keywords = [kw.capitalize() for kw in missing[:10]]
+        # Estimate experience (simple version)
+        experience_years = functions.estimate_experience(resume_text)
+        required_years = functions.estimate_required_experience(job_desc)
 
-        return jsonify({
-            'matchPercentage': match_percent,
-            'missingKeywords': missing_keywords,
-            'suggestedSkills': functions.suggest_related_skills(missing)
-        })
+        # Generate response
+        response = {
+            'overallMatch': match_percent,
+            'detailedAnalysis': {
+                'skills': {
+                    'matchPercentage': coverage_percent,
+                    'matchingSkills': [kw.capitalize() for kw in matched_keywords[:15]],
+                    'missingSkills': [kw.capitalize() for kw in missing_keywords[:15]],
+                    'suggestedSkills': functions.suggest_related_skills(missing_keywords)[:10]
+                },
+                'experience': {
+                    'yearsRequired': required_years,
+                    'yearsActual': experience_years,
+                    'meetsMinimum': experience_years >= required_years,
+                    'meetsPreferred': experience_years >= (required_years + 2)
+                },
+                'ats': {
+                    'score': functions.calculate_ats_score(resume_text),
+                    'issues': functions.check_ats_issues(resume_text)
+                }
+            },
+            'improvementSuggestions': functions.generate_suggestions(
+                missing_keywords, 
+                experience_years, 
+                required_years,
+                resume_text
+            )
+        }
+
+        return jsonify(response)
 
     except Exception as e:
         print(f'Error occurred in /analyze: {e}')
         return jsonify({'error': 'An error occurred while processing the resume'}), 500
     finally:
         os.remove(resume_path)
-
 
 @app.route('/recommend', methods=['POST'])
 def recommend_jobs():
@@ -325,6 +354,25 @@ def extract_strengths_endpoint():
     finally:
         os.remove(resume_path)
 
+
+@app.route('/match', methods=['POST'])
+def match_resume():
+    data = request.json
+    resume_id = data.get('resume_id')
+    job_desc = data.get('job_description')
+
+    if not resume_id or not job_desc:
+        return jsonify({'error': 'resume_id and job_description are required'}), 400
+
+    resume = Resume.query.get(resume_id)
+    if not resume:
+        return jsonify({'error': 'Resume not found'}), 404
+
+    resume_text = f"Name: {resume.name}\nEmail: {resume.email}\nSkills: {resume.skills}\nExperience: {resume.experience}\nEducation: {resume.education}"
+
+    ai_result = evaluate_resume_against_job(resume_text, job_desc)
+
+    return jsonify({'match_result': ai_result})
 
 if __name__ == '__main__':
     app.run(port=5001)
