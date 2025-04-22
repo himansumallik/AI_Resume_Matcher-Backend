@@ -7,15 +7,30 @@ import spacy
 import os
 import tempfile
 from collections import Counter
+import json
+
+
 import re
 import functions  # Import the functions module
+import openai
+from dotenv import load_dotenv
 from gpt_model import evaluate_resume_against_job
+from gpt_model import new_analyze_resume
+from gpt_model import get_groq_resume_structure
 
-load_dotenv()
+
+
+from gpt_model import get_groq_response
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))  
 
 app = Flask(__name__)
 CORS(app)
 nlp = spacy.load("en_core_web_sm")
+
+
+openai.api_key = "[REDACTED]"
+
 
 # Database Configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL", 'postgresql://postgres:7448596@localhost/resume_matcher')
@@ -24,6 +39,13 @@ db.init_app(app)
 
 with app.app_context():
     db.create_all()
+
+
+resume_text = "Experienced Python developer with projects in web development and data science."
+job_description = "Looking for a Python backend developer experienced in APIs and databases."
+
+result = evaluate_resume_against_job(resume_text, job_description)
+
 
 # Upload Folder Configuration
 UPLOAD_FOLDER = 'uploads'
@@ -46,6 +68,7 @@ def handle_file_upload(request_files, field_name, upload_dir):
     return file_path, None, None
 
 
+
 @app.route('/analyze', methods=['POST'])
 def analyze_resume():
     resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
@@ -54,105 +77,48 @@ def analyze_resume():
 
     job_desc = request.form.get('job_description')
     if not job_desc:
-        os.remove(resume_path)
+        if os.path.exists(resume_path):
+            os.remove(resume_path)
         return jsonify({'error': 'Job description is required'}), 400
 
     try:
-        # Extract text and keywords
+        # Extract text from resume
         resume_text = functions.extract_text_from_pdf(resume_path)
-        resume_keywords = functions.extract_keywords(resume_text)
-        job_keywords = functions.extract_keywords(job_desc)
 
-        # Calculate matches
-        matched_keywords = list(set(resume_keywords) & set(job_keywords))
-        missing_keywords = [kw for kw in job_keywords if kw not in resume_keywords]
-        
-        # Calculate percentages
-        match_percent = round(len(matched_keywords) / len(job_keywords) * 100, 2) if job_keywords else 0
-        coverage_percent = round(len(matched_keywords) / len(resume_keywords) * 100, 2) if resume_keywords else 0
+        # Structured AI Feedback via Groq
+        print('Running structured AI analysis...')
+        ai_result = new_analyze_resume(resume_text, job_desc)
+        print('AI Analysis Complete')
 
-        # Estimate experience (simple version)
-        experience_years = functions.estimate_experience(resume_text)
-        required_years = functions.estimate_required_experience(job_desc)
+        ai_analysis = ai_result.get('analysis')
+        if not isinstance(ai_analysis, dict):
+            print("AI analysis is not in expected dictionary format.")
+            return jsonify({'error': 'Failed to parse structured AI response'}), 500
 
-        # Generate response
         response = {
-            'overallMatch': match_percent,
+            'overallMatch': ai_analysis.get('match_percent', 0),
             'detailedAnalysis': {
                 'skills': {
-                    'matchPercentage': coverage_percent,
-                    'matchingSkills': [kw.capitalize() for kw in matched_keywords[:15]],
-                    'missingSkills': [kw.capitalize() for kw in missing_keywords[:15]],
-                    'suggestedSkills': functions.suggest_related_skills(missing_keywords)[:10]
+                    'matchPercentage': ai_analysis.get('match_percent', 0),
+                    'matchingSkills': [kw.capitalize() for kw in ai_analysis.get('matching_skills', [])[:15]],
+                    'missingSkills': [kw.capitalize() for kw in ai_analysis.get('missing_skills', [])[:15]],
+                    'suggestedSkills': ai_analysis.get('suggested_skills', [])[:10]
                 },
-                'experience': {
-                    'yearsRequired': required_years,
-                    'yearsActual': experience_years,
-                    'meetsMinimum': experience_years >= required_years,
-                    'meetsPreferred': experience_years >= (required_years + 2)
-                },
-                'ats': {
-                    'score': functions.calculate_ats_score(resume_text),
-                    'issues': functions.check_ats_issues(resume_text)
-                }
+                'experience': ai_analysis.get('experience', {}),
+                'ats': ai_analysis.get('ats', {}),
+                'aiAnalysis': ai_analysis.get('overallSummary', '')
             },
-            'improvementSuggestions': functions.generate_suggestions(
-                missing_keywords, 
-                experience_years, 
-                required_years,
-                resume_text
-            )
+            'improvementSuggestions': ai_analysis.get('improvements', [])
         }
 
         return jsonify(response)
 
     except Exception as e:
-        print(f'Error occurred in /analyze: {e}')
+        print(f'Error occurred in /analyze: {str(e)}')
         return jsonify({'error': 'An error occurred while processing the resume'}), 500
     finally:
-        os.remove(resume_path)
-
-@app.route('/recommend', methods=['POST'])
-def recommend_jobs():
-    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
-    if error:
-        return error, status_code
-
-    try:
-        resume_text = functions.extract_text_from_pdf(resume_path)
-        conn = functions.get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, title, company, description FROM jobs")
-        jobs = cursor.fetchall()
-        cursor.close()
-        conn.close()
-
-        resume_doc = nlp(resume_text.lower())
-        resume_tokens = set([token.lemma_ for token in resume_doc if token.is_alpha])
-
-        recommendations = []
-        for job in jobs:
-            job_id, title, company, description = job
-            job_doc = nlp(description.lower())
-            job_tokens = set([token.lemma_ for token in job_doc if token.is_alpha])
-            match = resume_tokens.intersection(job_tokens)
-            score = round(len(match) / len(job_tokens) * 100, 2) if job_tokens else 0
-            recommendations.append({
-                'id': job_id,
-                'title': title,
-                'company': company,
-                'description': description,
-                'matchPercentage': score
-            })
-
-        top_matches = sorted(recommendations, key=lambda x: x['matchPercentage'], reverse=True)[:5]
-        return jsonify(top_matches)
-
-    except Exception as e:
-        print(f'Error occurred in /recommend: {e}')
-        return jsonify({'error': 'An error occurred while recommending jobs'}), 500
-    finally:
-        os.remove(resume_path)
+        if os.path.exists(resume_path):
+            os.remove(resume_path)
 
 
 @app.route('/upload_resume', methods=['POST'])
@@ -187,122 +153,31 @@ def upload_resume():
 
 @app.route('/format-check', methods=['POST'])
 def check_formatting():
-    resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
-    if error:
-        return error, status_code
-
     try:
+        resume_path, error, status_code = handle_file_upload(request.files, 'resume', app.config['UPLOAD_FOLDER'])
+        if error:
+            return error, status_code
+        
         resume_text = functions.extract_text_from_pdf(resume_path)
-        suggestions = []
-        strengths = []
-        metrics = {
-            'wordCount': len(resume_text.split()),
-            'bulletPoints': resume_text.count('\n•') + resume_text.count('\n-'),
-            'sections': 0,
-            'hasContact': False,
-            'hasSummary': False,
-            'hasEducation': False,
-            'hasExperience': False,
-            'hasSkills': False
-        }
-
-        # ===== Conditional Checks =====
-        # 1. Length Analysis (Only suggest if below threshold)
-        if metrics['wordCount'] < 300:
-            suggestions.append({
-                'type': 'length',
-                'message': "Resume appears too short ({} words). Ideal length is 300-500 words.".format(metrics['wordCount']),
-                'priority': 'high' if metrics['wordCount'] < 200 else 'medium'
-            })
-        else:
-            strengths.append("✓ Appropriate length ({} words)".format(metrics['wordCount']))
-
-        # 2. Section Presence Checks
-        required_sections = {
-            'contact': (r'(email|phone|contact)', "Include contact information"),
-            'summary': (r'(summary|objective|profile)', "Add a professional summary"),
-            'education': (r'education', "Include education section"),
-            'experience': (r'(experience|work\s?history)', "Add work experience"),
-            'skills': (r'(skills|technical\s?skills)', "List technical skills")
-        }
-
-        for section, (pattern, suggestion) in required_sections.items():
-            if not re.search(pattern, resume_text, re.IGNORECASE):
-                suggestions.append({
-                    'type': section,
-                    'message': suggestion,
-                    'priority': 'high' if section in ['contact', 'experience'] else 'medium'
-                })
-            else:
-                strengths.append("✓ Complete {} section".format(section))
-                metrics[f'has{section.capitalize()}'] = True
-
-        # 3. Bullet Points Analysis (Only suggest if sparse)
-        if metrics['bulletPoints'] < 10:
-            suggestions.append({
-                'type': 'formatting',
-                'message': "Low bullet point count ({}). Use bullet points to highlight achievements.".format(metrics['bulletPoints']),
-                'priority': 'medium'
-            })
-        else:
-            strengths.append("✓ Good use of bullet points ({})".format(metrics['bulletPoints']))
-
-        # 4. Contact Info Validation
-        if not (re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', resume_text) and 
-                re.search(r'(\+\d{1,2}\s?)?(\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}', resume_text)):
-            suggestions.append({
-                'type': 'contact',
-                'message': "Missing email or phone number",
-                'priority': 'high'
-            })
-        else:
-            metrics['hasContact'] = True
-
-        # 5. Skills Quantification (Only suggest if <5 skills)
-        skills_match = re.search(r'(?i)skills:(.*?)(?:\n\n|\n\w+:)', resume_text)
-        if skills_match:
-            skills_count = len([s.strip() for s in skills_match.group(1).split(',') if s.strip()])
-            metrics['skillsCount'] = skills_count
-            if skills_count < 5:
-                suggestions.append({
-                    'type': 'skills',
-                    'message': "Consider adding more skills (currently {})".format(skills_count),
-                    'priority': 'medium'
-                })
-        elif metrics['hasSkills']:  # Has skills section but no countable skills
-            suggestions.append({
-                'type': 'skills',
-                'message': "Skills section is empty",
-                'priority': 'medium'
-            })
-
-        # 6. Section Count Analysis
-        metrics['sections'] = sum(1 for section in required_sections if metrics[f'has{section.capitalize()}'])
-        if metrics['sections'] >= 4:
-            strengths.append("✓ Well-structured ({} sections)".format(metrics['sections']))
-        else:
-            suggestions.append({
-                'type': 'structure',
-                'message': "Resume could use more sections (currently {})".format(metrics['sections']),
-                'priority': 'medium'
-            })
-
-        # ===== Final Filtering =====
-        # Only include suggestions that meet minimum priority thresholds
-        filtered_suggestions = [s for s in suggestions if s['priority'] in ('high', 'medium')]
+        analysis = get_groq_resume_structure(resume_text)
         
         return jsonify({
-            'suggestions': filtered_suggestions,
-            'strengths': strengths,
-            'metrics': metrics,
-            'score': functions.calculate_score(filtered_suggestions)
+            'suggestions': analysis['suggestions'],
+            'strengths': analysis['strengths'],
+            'metrics': analysis['metrics'],
+            'score': functions.calculate_score(analysis['suggestions'])
         })
-
+        
     except Exception as e:
-        print(f"Error in /format-check: {e}")
-        return jsonify({'error': str(e)}), 500
+        print(f"Endpoint error: {str(e)}")
+        return jsonify({
+            'error': 'Failed to analyze resume',
+            'details': str(e)
+        }), 500
+        
     finally:
-        os.remove(resume_path)
+        if os.path.exists(resume_path):
+            os.remove(resume_path)
 
 
 
