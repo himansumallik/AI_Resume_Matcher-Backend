@@ -29,7 +29,7 @@ CORS(app)
 nlp = spacy.load("en_core_web_sm")
 
 
-#openai.api_key = "my_key"
+openai.api_key = os.getenv("OPENAI_API_KEY")  # Load from .env file or environment
 
 
 # Database Configuration
